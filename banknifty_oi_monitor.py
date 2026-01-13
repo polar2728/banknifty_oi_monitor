@@ -124,6 +124,7 @@ def select_trade_strike(atm, buildup_type):
 # ================= SCAN =================
 def scan():
     if CHECK_MARKET_HOURS and not is_market_open():
+        print("⏱ Market closed")
         return
 
     baseline = reset_day(load_baseline())
