@@ -35,7 +35,7 @@ jobs:
           restore-keys: |
             bn_baseline_oi-
 
-      - name: Run NIFTY OI Scanner
+      - name: Run BankNifty OI Scanner
         run: |
           echo "Event: $GITHUB_EVENT_NAME"
           python banknifty_oi_monitor.py
