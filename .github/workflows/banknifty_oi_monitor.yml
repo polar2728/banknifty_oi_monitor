@@ -3,58 +3,37 @@ name: BankNifty OI Spike Monitor
 on:
   workflow_dispatch:
 
+concurrency:
+  group: banknifty-oi-monitor
+  cancel-in-progress: true
+
 jobs:
   scan:
     runs-on: ubuntu-latest
 
     env:
-      DEBUG_MODE: ${{ vars.DEBUG_MODE }}
       CLIENT_ID: ${{ secrets.CLIENT_ID }}
       ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
         run: pip install fyers-apiv3 pandas requests
 
-      # ✅ RESTORE BASELINE (from previous runs)
-      - name: Restore baseline cache
-        uses: actions/cache@v3
-        with:
-          path: bn_baseline_oi.json
-          key: bn_baseline_oi-${{ github.run_id }}
-          restore-keys: |
-            bn_baseline_oi-
-
-      - name: Run BankNifty OI Scanner
-        run: |
-          echo "Event: $GITHUB_EVENT_NAME"
-          python banknifty_oi_monitor.py
-
-      # ✅ SAVE UPDATED BASELINE
-      - name: Cache baseline file
+      - name: Restore baseline
         uses: actions/cache@v3
         with:
           path: bn_baseline_oi.json
           key: bn_baseline_oi-v1
+          restore-keys: |
+            bn_baseline_oi-
 
-      - name: Inspect baseline cache
-        run: |
-         echo "📂 Workspace files:"
-         ls -lh
-         if [ -f bn_baseline_oi.json ]; then
-            echo "✅ bn_baseline_oi.json exists"
-            echo "📄 Contents:"
-            cat bn_baseline_oi.json
-         else
-            echo "❌ bn_baseline_oi.json NOT found"
-         fi
+      - name: Run BankNifty OI Scanner
+        run: python banknifty_oi_monitor.py
