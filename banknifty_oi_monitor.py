@@ -162,7 +162,7 @@ def scan():
 
     # ---- Option Chain ----
     chain_resp = safe_api_call(fyers.optionchain, {
-        "symbol": "NSE:BANKNIFTY",
+        "symbol": "NSE:NIFTYBANK-INDEX",
         "strikecount": 40,
         "timestamp": ""
     })
