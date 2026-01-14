@@ -109,12 +109,15 @@ def save_baseline(b):
 def reset_day(b):
     today = now_ist().date().isoformat()
     if b.get("date") != today:
+        print("🔄 New trading day → baseline reset")
         b["date"] = today
         b["started"] = False
         b["day_open"] = None
         b["data"] = {}
         save_baseline(b)
     return b
+
+
 
 # ================= EXPIRY =================
 def expiry_to_symbol_format(date_str):
