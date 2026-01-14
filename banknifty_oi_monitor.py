@@ -119,7 +119,9 @@ def reset_day(b):
 # ================= EXPIRY =================
 def expiry_to_symbol_format(date_str):
     d = datetime.strptime(date_str, "%d-%m-%Y")
-    return d.strftime("%y") + str(d.month) + d.strftime("%d")
+    year_short = d.strftime("%y")                # "26"
+    month_short = d.strftime("%b").upper()       # "JAN", "FEB", "MAR", ..., "DEC"
+    return year_short + month_short              # "26JAN"
 
 def get_monthly_expiry(expiry_info):
     today = now_ist().date()
@@ -198,9 +200,16 @@ def scan():
         return
 
     expiry = expiry_to_symbol_format(expiry_date)
+    # After calculating expiry
+    print(f"Selected monthly expiry date: {expiry_date}")
+    print(f"Expiry filter string: {expiry}")
+    print(f"Total raw options: {len(raw)}")
+    print(f"After expiry filter: {len(df[df['symbol'].str.contains(expiry)])}")
+    print(f"After strike range filter: {len(df)}")
 
     df = pd.DataFrame(raw)
-    df = df[df["symbol"].str.contains(expiry)]
+    # df = df[df["symbol"].str.contains(expiry)]
+    df = df[df["symbol"].str.contains(f"BANKNIFTY{expiry}", regex=False)]
     df = df[
         (df["strike_price"].between(atm - STRIKE_RANGE, atm + STRIKE_RANGE)) &
         (df["strike_price"] % 100 == 0)
@@ -272,7 +281,10 @@ def scan():
         baseline["started"] = True
         updated = True
 
-    if updated:
+    if updated or not baseline["started"]:
+        if not baseline["data"]:
+            print("WARNING: No strikes captured into baseline today. Check expiry filter, MIN_BASE_OI, or API data.")
+            # Optionally: send_telegram("⚠️ Baseline empty - no OI monitoring today")
         save_baseline(baseline)
 
 # ================= ENTRY =================
