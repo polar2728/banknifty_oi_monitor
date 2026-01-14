@@ -97,11 +97,20 @@ def get_banknifty_spot():
 
 def fetch_option_chain():
     r = fyers.optionchain({
-        "symbol": "NSE:BANKNIFTY-INDEX",
+        "symbol": "NSE:BANKNIFTY",
         "strikecount": 40,
         "timestamp": ""
     })
-    return r["data"]["optionsChain"]
+
+    if r.get("s") != "ok":
+        raise RuntimeError(f"❌ FYERS optionchain error: {r}")
+
+    data = r.get("data", {})
+    if "optionsChain" not in data:
+        raise RuntimeError(f"❌ optionsChain missing in response: {r}")
+
+    return data["optionsChain"]
+
 
 # ================= STRIKE SELECTION =================
 def select_trade_strike(atm, buildup_type):
