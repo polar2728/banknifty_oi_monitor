@@ -174,10 +174,10 @@ def scan():
     print("Full chain_resp keys:", list(chain_resp.keys()))            # Debug: see what's actually there
 
     if chain_resp.get("s") != "ok":
-    msg = f"Optionchain failed: {chain_resp.get('message', 'Unknown error')} (code: {chain_resp.get('code')})"
-    print(msg)
-    # Optional: send_telegram(msg) if you want alert
-    return
+        msg = f"Optionchain failed: {chain_resp.get('message', 'Unknown error')} (code: {chain_resp.get('code')})"
+        print(msg)
+        # Optional: send_telegram(msg) if you want alert
+        return
 
     # Now safely access
     data = chain_resp.get("data", {})
