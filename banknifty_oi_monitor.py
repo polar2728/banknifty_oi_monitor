@@ -167,13 +167,34 @@ def scan():
         "timestamp": ""
     })
     if not chain_resp:
+        print("Option chain API call returned None — likely network/auth issue")
         return
 
+    print("Optionchain response status:", chain_resp.get("s"))          # Debug: 'ok' or 'error'
+    print("Full chain_resp keys:", list(chain_resp.keys()))            # Debug: see what's actually there
+
+    if chain_resp.get("s") != "ok":
+    msg = f"Optionchain failed: {chain_resp.get('message', 'Unknown error')} (code: {chain_resp.get('code')})"
+    print(msg)
+    # Optional: send_telegram(msg) if you want alert
+    return
+
+    # Now safely access
+    data = chain_resp.get("data", {})
+    if not data:
+        print("Response 'ok' but no 'data' key — possibly after-hours empty response")
+        return
+    
     raw = chain_resp["data"]["optionsChain"]
     expiry_info = chain_resp["data"]["expiryData"]
 
+    if not raw:
+        print("No optionsChain data returned (empty list) — likely market closed or no contracts loaded")
+        return
+
     expiry_date = get_monthly_expiry(expiry_info)
     if not expiry_date:
+        print("No suitable monthly expiry found")
         return
 
     expiry = expiry_to_symbol_format(expiry_date)
