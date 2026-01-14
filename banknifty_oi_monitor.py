@@ -10,7 +10,7 @@ OI_WATCH_THRESHOLD    = 300    # %
 OI_EXEC_THRESHOLD     = 500    # %
 MIN_BASE_OI           = 1000
 STRIKE_RANGE_POINTS   = 300
-CHECK_MARKET_HOURS    = False
+CHECK_MARKET_HOURS    = True
 BASELINE_FILE         = "bn_baseline_oi.json"
 
 # ================= TIMEZONE =================
@@ -103,13 +103,12 @@ def fetch_option_chain():
     })
 
     if r.get("s") != "ok":
-        raise RuntimeError(f"❌ FYERS optionchain error: {r}")
+        print("⚠️ Option chain unavailable:", r.get("message"))
+        return []
 
     data = r.get("data", {})
-    if "optionsChain" not in data:
-        raise RuntimeError(f"❌ optionsChain missing in response: {r}")
+    return data.get("optionsChain", [])
 
-    return data["optionsChain"]
 
 
 # ================= STRIKE SELECTION =================
@@ -133,6 +132,10 @@ def scan():
     atm = int(round(spot / 100) * 100)
 
     raw = fetch_option_chain()
+    if not raw:
+        print("⏱ Skipping scan – option chain not available")
+        return
+    
     df = pd.DataFrame(raw)
 
     # 🔑 IMPORTANT: FYERS BankNifty symbols look like:
