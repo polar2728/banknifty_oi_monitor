@@ -199,6 +199,22 @@ def scan():
         print("No suitable monthly expiry found")
         return
 
+    days_to_expiry = (datetime.strptime(expiry_date, "%d-%m-%Y") - now_ist().date()).days
+    
+    if days_to_expiry > 14:
+        WATCH_OI_PCT = 70
+        EXEC_OI_PCT  = 200
+        print(f"Days to expiry: {days_to_expiry} → using low thresholds: {WATCH_OI_PCT}% / {EXEC_OI_PCT}% (early month)")
+    elif 8 <= days_to_expiry <= 14:
+        WATCH_OI_PCT = 150
+        EXEC_OI_PCT  = 300
+        print(f"Days to expiry: {days_to_expiry} → using medium thresholds: {WATCH_OI_PCT}% / {EXEC_OI_PCT}% (mid-cycle)")
+    else:  # <= 7 days
+        WATCH_OI_PCT = 300
+        EXEC_OI_PCT  = 500
+        print(f"Days to expiry: {days_to_expiry} → using high thresholds: {WATCH_OI_PCT}% / {EXEC_OI_PCT}% (expiry week)")
+    
+
     expiry = expiry_to_symbol_format(expiry_date)
 
     df = pd.DataFrame(raw)
