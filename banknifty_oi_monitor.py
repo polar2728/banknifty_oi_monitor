@@ -285,11 +285,14 @@ def scan():
         baseline["started"] = True
         updated = True
 
-    if updated or not baseline["started"]:
+    # NEW: Save if we added any entries (even without alerts)
+    if baseline["data"] or updated:  # or len(baseline["data"]) > 0
         if not baseline["data"]:
-            print("WARNING: No strikes captured into baseline today. Check expiry filter, MIN_BASE_OI, or API data.")
-            # Optionally: send_telegram("⚠️ Baseline empty - no OI monitoring today")
+            print("WARNING: Processed rows but no baseline entries added (all OI < MIN_BASE_OI?)")
         save_baseline(baseline)
+        print("Baseline saved — entries count:", len(baseline["data"]))
+    else:
+        print("No changes/alerts — baseline not saved this run")
 
 # ================= ENTRY =================
 if __name__ == "__main__":
