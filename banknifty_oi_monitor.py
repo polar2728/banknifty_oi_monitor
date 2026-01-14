@@ -73,12 +73,17 @@ def reset_on_new_day(b):
 
 # ================= API =================
 def get_banknifty_spot():
-    q = fyers.quotes({"symbols": "NSE:BANKNIFTY-INDEX"})
-    print("DEBUG SPOT RESPONSE:", q)
+    q = fyers.quotes({"symbols": "NSE:NIFTYBANK-INDEX"})
 
-    v = q["d"][0]["v"]
+    d = q.get("d", [])
+    if not d or "v" not in d[0]:
+        raise RuntimeError(f"❌ Invalid FYERS response: {q}")
 
-    # FYERS inconsistency handling
+    v = d[0]["v"]
+
+    if v.get("s") == "error":
+        raise RuntimeError(f"❌ FYERS error: {v}")
+
     if "lp" in v:
         return float(v["lp"])
     if "ltp" in v:
@@ -87,6 +92,7 @@ def get_banknifty_spot():
         return float(v["last_price"])
 
     raise RuntimeError(f"❌ Spot price not found in FYERS response: {v}")
+
 
 
 def fetch_option_chain():
