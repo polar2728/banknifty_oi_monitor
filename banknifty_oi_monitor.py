@@ -200,20 +200,24 @@ def scan():
         return
 
     expiry = expiry_to_symbol_format(expiry_date)
-    # After calculating expiry
-    print(f"Selected monthly expiry date: {expiry_date}")
-    print(f"Expiry filter string: {expiry}")
-    print(f"Total raw options: {len(raw)}")
-    print(f"After expiry filter: {len(df[df['symbol'].str.contains(expiry)])}")
-    print(f"After strike range filter: {len(df)}")
 
     df = pd.DataFrame(raw)
-    # df = df[df["symbol"].str.contains(expiry)]
-    df = df[df["symbol"].str.contains(f"BANKNIFTY{expiry}", regex=False)]
+    # First filter: expiry code in symbol
+    df = df[df["symbol"].str.contains(expiry, regex=False)]
+    
+    # Second filter: strike range around ATM + valid strikes
     df = df[
         (df["strike_price"].between(atm - STRIKE_RANGE, atm + STRIKE_RANGE)) &
         (df["strike_price"] % 100 == 0)
     ]
+
+    # Now safe to print debug info
+    print(f"Selected monthly expiry date: {expiry_date}")
+    print(f"Expiry filter string: {expiry}")
+    print(f"Total raw options: {len(raw)}")
+    print(f"After expiry filter: {len(df[df['symbol'].str.contains(expiry)])}")  # redundant now, but ok
+    print(f"After strike range filter: {len(df)}")
+    print(f"Number of valid CE/PE rows: {len(df[df['option_type'].isin(['CE', 'PE'])])}")
 
     updated = False
 
