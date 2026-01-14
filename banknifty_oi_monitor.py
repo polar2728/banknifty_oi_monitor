@@ -1,17 +1,22 @@
 import os
 import json
+import time
 import pandas as pd
+import requests
 from datetime import datetime, timedelta, timezone
 from fyers_apiv3 import fyersModel
-import requests
 
 # ================= CONFIG =================
-OI_WATCH_THRESHOLD    = 300    # %
-OI_EXEC_THRESHOLD     = 500    # %
-MIN_BASE_OI           = 1000
-STRIKE_RANGE_POINTS   = 300
-CHECK_MARKET_HOURS    = True
-BASELINE_FILE         = "bn_baseline_oi.json"
+WATCH_OI_PCT        = 70
+EXEC_OI_PCT         = 140
+SPOT_MOVE_PCT       = 0.3
+VOL_MULTIPLIER      = 1.5
+MIN_BASE_OI         = 2000
+STRIKE_RANGE        = 200
+CHECK_MARKET_HOURS  = False
+BASELINE_FILE       = "bn_baseline_oi.json"
+
+DEBUG_MODE = str(os.environ.get("DEBUG_MODE", "false")).lower() == "true"
 
 # ================= TIMEZONE =================
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -40,182 +45,214 @@ def is_market_open():
     t = now_ist().time()
     return datetime.strptime("09:15", "%H:%M").time() <= t <= datetime.strptime("15:30", "%H:%M").time()
 
-def send_telegram_alert(message):
+def after_1015():
+    return now_ist().time() >= datetime.strptime("10:15", "%H:%M").time()
+
+def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
-        requests.post(url, data=payload, timeout=10)
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
+            timeout=10
+        )
     except Exception as e:
         print("Telegram error:", e)
+
+def safe_api_call(fn, payload, retries=3, delay=1):
+    for _ in range(retries):
+        try:
+            resp = fn(payload)
+            if resp and ("d" in resp or "data" in resp):
+                return resp
+        except Exception:
+            time.sleep(delay)
+    return None
+
+# ================= SAFE SPOT FETCH =================
+def get_banknifty_spot():
+    resp = safe_api_call(fyers.quotes, {"symbols": "NSE:NIFTYBANK-INDEX"})
+    if not resp or "d" not in resp or not resp["d"]:
+        return None
+
+    try:
+        v = resp["d"][0].get("v", {})
+        lp = v.get("lp") or v.get("ltp") or v.get("prev_close_price")
+
+        if lp is None or lp == 0:
+            return None
+
+        return float(lp)
+
+    except Exception:
+        if DEBUG_MODE:
+            print("❌ Spot parse error:", resp)
+        return None
 
 # ================= BASELINE =================
 def load_baseline():
     if os.path.exists(BASELINE_FILE):
         with open(BASELINE_FILE, "r") as f:
             return json.load(f)
-    return {"date": None, "data": {}, "first_alert_sent": False}
+    return {
+        "date": None,
+        "started": False,
+        "day_open": None,
+        "data": {}
+    }
 
 def save_baseline(b):
     with open(BASELINE_FILE, "w") as f:
         json.dump(b, f, indent=2)
 
-def reset_on_new_day(b):
+def reset_day(b):
     today = now_ist().date().isoformat()
     if b.get("date") != today:
-        print("🔄 New trading day → baseline reset")
         b["date"] = today
+        b["started"] = False
+        b["day_open"] = None
         b["data"] = {}
-        b["first_alert_sent"] = False
         save_baseline(b)
     return b
 
-# ================= API =================
-def get_banknifty_spot():
-    q = fyers.quotes({"symbols": "NSE:NIFTYBANK-INDEX"})
+# ================= EXPIRY =================
+def expiry_to_symbol_format(date_str):
+    d = datetime.strptime(date_str, "%d-%m-%Y")
+    return d.strftime("%y") + str(d.month) + d.strftime("%d")
 
-    d = q.get("d", [])
-    if not d or "v" not in d[0]:
-        raise RuntimeError(f"❌ Invalid FYERS response: {q}")
-
-    v = d[0]["v"]
-
-    if v.get("s") == "error":
-        raise RuntimeError(f"❌ FYERS error: {v}")
-
-    if "lp" in v:
-        return float(v["lp"])
-    if "ltp" in v:
-        return float(v["ltp"])
-    if "last_price" in v:
-        return float(v["last_price"])
-
-    raise RuntimeError(f"❌ Spot price not found in FYERS response: {v}")
-
-
-
-def fetch_option_chain():
-    r = fyers.optionchain({
-        "symbol": "NSE:BANKNIFTY",
-        "strikecount": 40,
-        "timestamp": ""
-    })
-
-    if r.get("s") != "ok":
-        print("⚠️ Option chain unavailable:", r.get("message"))
-        return []
-
-    data = r.get("data", {})
-    return data.get("optionsChain", [])
-
-
+def get_monthly_expiry(expiry_info):
+    today = now_ist().date()
+    expiries = []
+    for e in expiry_info:
+        try:
+            exp = datetime.fromtimestamp(int(e["expiry"])).date()
+            days = (exp - today).days
+            if days >= 7:
+                expiries.append((days, e["date"]))
+        except:
+            continue
+    return sorted(expiries, key=lambda x: x[0])[0][1] if expiries else None
 
 # ================= STRIKE SELECTION =================
 def select_trade_strike(atm, buildup_type):
-    if buildup_type == "CE":   # short buildup → buy PE
+    if buildup_type == "CE":
         return atm - 100, "PE"
-    else:                      # long buildup → buy CE
+    else:
         return atm + 100, "CE"
 
 # ================= SCAN =================
 def scan():
-    print("▶ BankNifty scan started")
-
     if CHECK_MARKET_HOURS and not is_market_open():
         print("⏱ Market closed")
         return
 
-    baseline = reset_on_new_day(load_baseline())
+    baseline = reset_day(load_baseline())
 
+    # ---- Spot (SAFE) ----
     spot = get_banknifty_spot()
+    if spot is None:
+        print("⚠ BANKNIFTY spot unavailable — skipping scan")
+        return
+
+    if baseline["day_open"] is None:
+        baseline["day_open"] = spot
+
     atm = int(round(spot / 100) * 100)
 
-    raw = fetch_option_chain()
-    if not raw:
-        print("⏱ Skipping scan – option chain not available")
+    # ---- Option Chain ----
+    chain_resp = safe_api_call(fyers.optionchain, {
+        "symbol": "NSE:BANKNIFTY",
+        "strikecount": 40,
+        "timestamp": ""
+    })
+    if not chain_resp:
         return
-    
+
+    raw = chain_resp["data"]["optionsChain"]
+    expiry_info = chain_resp["data"]["expiryData"]
+
+    expiry_date = get_monthly_expiry(expiry_info)
+    if not expiry_date:
+        return
+
+    expiry = expiry_to_symbol_format(expiry_date)
+
     df = pd.DataFrame(raw)
+    df = df[df["symbol"].str.contains(expiry)]
+    df = df[
+        (df["strike_price"].between(atm - STRIKE_RANGE, atm + STRIKE_RANGE)) &
+        (df["strike_price"] % 100 == 0)
+    ]
 
-    # 🔑 IMPORTANT: FYERS BankNifty symbols look like:
-    # BANKNIFTY 26Jan27 59500 CE
-    df = df[df["symbol"].str.contains("BANKNIFTY", regex=False)]
-
-    print("📊 Rows after BANKNIFTY filter:", len(df))
+    updated = False
 
     for _, r in df.iterrows():
-        try:
-            parts = r.symbol.split()
-            strike = int(parts[2])   # 59500
-            opt    = parts[3]        # CE / PE
-        except Exception:
-            continue
+        strike = int(r.get("strike_price", 0))
+        opt    = r.get("option_type", "")
+        oi     = int(r.get("oi", 0))
+        vol    = int(r.get("volume", 0))
 
-        if not (atm - STRIKE_RANGE_POINTS <= strike <= atm + STRIKE_RANGE_POINTS):
+        if strike == 0 or opt not in ("CE", "PE"):
             continue
-
-        oi  = int(r.oi)
-        ltp = float(r.ltp)
-        vol = int(r.volume)
 
         key = f"{opt}_{strike}"
-        entry = baseline["data"].get(key)
+        entry = baseline["data"].setdefault(key, {
+            "base_oi": oi,
+            "base_vol": vol,
+            "state": "NONE"
+        })
 
-        # ================= BASELINE INIT =================
-        if entry is None:
-            baseline["data"][key] = {
-                "baseline_oi": oi,
-                "baseline_ltp": ltp,
-                "baseline_vol": vol,
-                "state": "NONE"
-            }
+        if entry["base_oi"] < MIN_BASE_OI:
             continue
 
-        base_oi  = entry["baseline_oi"]
-        base_ltp = entry["baseline_ltp"]
-        base_vol = entry["baseline_vol"]
-        state    = entry["state"]
+        oi_pct = ((oi - entry["base_oi"]) / entry["base_oi"]) * 100
+        vol_ok = vol > entry["base_vol"] * VOL_MULTIPLIER
 
-        if base_oi < MIN_BASE_OI:
-            continue
-
-        oi_pct = ((oi - base_oi) / base_oi) * 100
-        ltp_ok = ltp > base_ltp * 1.05
-        vol_ok = vol > base_vol * 1.3
-
-        # ================= WATCH =================
-        if oi_pct >= OI_WATCH_THRESHOLD and state == "NONE":
-            send_telegram_alert(
-                f"👀 *BANKNIFTY OI WATCH*\n"
+        # ---- WATCH ----
+        if oi_pct >= WATCH_OI_PCT and entry["state"] == "NONE":
+            send_telegram(
+                f"👀 *BN OI WATCH*\n"
                 f"{strike} {opt}\n"
                 f"OI +{oi_pct:.0f}%\n"
-                f"Spot: {spot:.0f}"
+                f"Spot: {spot:.0f}  ATM: {atm}"
             )
             entry["state"] = "WATCH"
+            updated = True
 
-        # ================= EXECUTION =================
-        if oi_pct >= OI_EXEC_THRESHOLD and state == "WATCH":
-            if ltp_ok and vol_ok:
-                trade_strike, trade_opt = select_trade_strike(atm, opt)
-                send_telegram_alert(
-                    f"🚀 *BANKNIFTY EXECUTION*\n"
-                    f"{opt} buildup confirmed\n"
-                    f"Buy {trade_strike} {trade_opt}\n\n"
-                    f"OI +{oi_pct:.0f}%\n"
-                    f"LTP ↑ | Volume ↑\n"
-                    f"Spot: {spot:.0f}"
-                )
-                entry["state"] = "EXECUTED"
+        # ---- EXECUTE ----
+        if oi_pct >= EXEC_OI_PCT and entry["state"] == "WATCH":
+            if not after_1015():
+                continue
 
-    if not baseline["first_alert_sent"]:
-        send_telegram_alert(
-            f"*BANKNIFTY OI MONITOR STARTED*\n"
-            f"Spot: {spot:.0f}\nATM: {atm}"
+            spot_move = abs(spot - baseline["day_open"]) / baseline["day_open"] * 100
+            if spot_move < SPOT_MOVE_PCT or not vol_ok:
+                continue
+
+            trade_strike, trade_opt = select_trade_strike(atm, opt)
+
+            send_telegram(
+                f"🚀 *BANK NIFTY EXECUTION*\n"
+                f"{opt} buildup @ {strike}\n"
+                f"→ Buy {trade_strike} {trade_opt}\n\n"
+                f"OI +{oi_pct:.0f}%   Vol ↑\n"
+                f"Spot Move: {spot_move:.2f}%"
+            )
+
+            entry["state"] = "EXECUTED"
+            updated = True
+
+    if not baseline["started"]:
+        send_telegram(
+            f"*BANK NIFTY OI MONITOR STARTED*\n"
+            f"Spot: {spot:.0f}   ATM: {atm}\n"
+            f"Monthly expiry: {expiry_date}"
         )
-        baseline["first_alert_sent"] = True
+        baseline["started"] = True
+        updated = True
 
-    save_baseline(baseline)
+    if updated:
+        save_baseline(baseline)
 
 # ================= ENTRY =================
 if __name__ == "__main__":
