@@ -60,15 +60,35 @@ def send_telegram(msg):
     except Exception as e:
         print("Telegram error:", e)
 
-def safe_api_call(fn, payload, retries=2, delay=1):
+def safe_api_call(fn, payload, retries=3, delay=1):
     for _ in range(retries):
         try:
             resp = fn(payload)
-            if resp and "d" in resp or "data" in resp:
+            if resp and ("d" in resp or "data" in resp):
                 return resp
         except Exception:
             time.sleep(delay)
     return None
+
+# ================= SAFE SPOT FETCH =================
+def get_banknifty_spot():
+    resp = safe_api_call(fyers.quotes, {"symbols": "NSE:BANKNIFTY-INDEX"})
+    if not resp or "d" not in resp or not resp["d"]:
+        return None
+
+    try:
+        v = resp["d"][0].get("v", {})
+        lp = v.get("lp") or v.get("ltp") or v.get("prev_close_price")
+
+        if lp is None or lp == 0:
+            return None
+
+        return float(lp)
+
+    except Exception:
+        if DEBUG_MODE:
+            print("❌ Spot parse error:", resp)
+        return None
 
 # ================= BASELINE =================
 def load_baseline():
@@ -129,12 +149,11 @@ def scan():
 
     baseline = reset_day(load_baseline())
 
-    # ---- Spot ----
-    spot_resp = safe_api_call(fyers.quotes, {"symbols": "NSE:BANKNIFTY-INDEX"})
-    if not spot_resp:
+    # ---- Spot (SAFE) ----
+    spot = get_banknifty_spot()
+    if spot is None:
+        print("⚠ BANKNIFTY spot unavailable — skipping scan")
         return
-
-    spot = float(spot_resp["d"][0]["v"]["lp"])
 
     if baseline["day_open"] is None:
         baseline["day_open"] = spot
@@ -207,10 +226,7 @@ def scan():
                 continue
 
             spot_move = abs(spot - baseline["day_open"]) / baseline["day_open"] * 100
-            if spot_move < SPOT_MOVE_PCT:
-                continue
-
-            if not vol_ok:
+            if spot_move < SPOT_MOVE_PCT or not vol_ok:
                 continue
 
             trade_strike, trade_opt = select_trade_strike(atm, opt)
