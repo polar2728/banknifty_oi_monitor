@@ -72,7 +72,7 @@ def safe_api_call(fn, payload, retries=3, delay=1):
 
 # ================= SAFE SPOT FETCH =================
 def get_banknifty_spot():
-    resp = safe_api_call(fyers.quotes, {"symbols": "NSE:BANKNIFTY-INDEX"})
+    resp = safe_api_call(fyers.quotes, {"symbols": "NSE:NIFTYBANK-INDEX"})
     if not resp or "d" not in resp or not resp["d"]:
         return None
 
@@ -162,7 +162,7 @@ def scan():
 
     # ---- Option Chain ----
     chain_resp = safe_api_call(fyers.optionchain, {
-        "symbol": "NSE:BANKNIFTY-INDEX",
+        "symbol": "NSE:NIFTYBANK-INDEX",
         "strikecount": 40,
         "timestamp": ""
     })
