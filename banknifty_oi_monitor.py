@@ -199,7 +199,28 @@ def scan():
         print("No suitable monthly expiry found")
         return
 
-    days_to_expiry = (datetime.strptime(expiry_date, "%d-%m-%Y") - now_ist().date()).days
+    expiry = expiry_to_symbol_format(expiry_date)
+
+    df = pd.DataFrame(raw)
+    df = df[df["symbol"].str.contains(expiry, regex=False)]
+    
+    df = df[
+        (df["strike_price"].between(atm - STRIKE_RANGE, atm + STRIKE_RANGE)) &
+        (df["strike_price"] % 100 == 0)
+    ]
+
+    # Debug prints
+    print(f"Selected monthly expiry date: {expiry_date}")
+    print(f"Expiry filter string: {expiry}")
+    print(f"Total raw options: {len(raw)}")
+    print(f"After expiry filter: {len(df[df['symbol'].str.contains(expiry)])}")
+    print(f"After strike range filter: {len(df)}")
+    print(f"Number of valid CE/PE rows: {len(df[df['option_type'].isin(['CE', 'PE'])])}")
+
+    # FIXED: Calculate days to expiry correctly
+    expiry_dt = datetime.strptime(expiry_date, "%d-%m-%Y").date()  # ← add .date()
+    today_dt = now_ist().date()
+    days_to_expiry = (expiry_dt - today_dt).days
     
     if days_to_expiry > 14:
         WATCH_OI_PCT = 70
