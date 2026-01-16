@@ -292,22 +292,21 @@ def scan():
             updated = True
 
         # ---- EXECUTE ----
-        if oi_pct >= EXEC_OI_PCT and entry["state"] == "WATCH":
+        if oi_pct >= EXEC_OI_PCT:
             if not after_1015():
                 continue
 
             spot_move = abs(spot - baseline["day_open"]) / baseline["day_open"] * 100
-            if spot_move < SPOT_MOVE_PCT or not vol_ok:
-                continue
-
             trade_strike, trade_opt = select_trade_strike(atm, opt)
 
             send_telegram(
                 f"🚀 *BANK NIFTY EXECUTION*\n"
                 f"{opt} buildup @ {strike}\n"
                 f"→ Buy {trade_strike} {trade_opt}\n\n"
-                f"OI +{oi_pct:.0f}%   Vol ↑\n"
-                f"Spot Move: {spot_move:.2f}%"
+                f"OI + {oi_pct:.0f}%   Vol ↑\n"
+                f"Spot Move: {spot_move:.0f}%\n"
+                f"Volume ↑ >30%: {vol_ok}\n"
+                f"Spot: {spot}"
             )
 
             entry["state"] = "EXECUTED"
