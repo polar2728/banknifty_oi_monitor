@@ -137,11 +137,13 @@ def get_monthly_expiry(expiry_info):
     return sorted(expiries, key=lambda x: x[0])[0][1] if expiries else None
 
 # ================= STRIKE SELECTION =================
-def select_trade_strike(atm, buildup_type):
-    if buildup_type == "CE":
-        return atm - 100, "PE"
-    else:
-        return atm + 100, "CE"
+
+def select_trade_strike(strike, buildup_type):
+    # Same-strike contrarian: buy opposite option at the same strike
+    if buildup_type == "CE":   # short buildup on CE → buy PE at same strike
+        return strike, "PE"
+    else:                      # short buildup on PE → buy CE at same strike
+        return strike, "CE"
 
 # ================= SCAN =================
 def scan():
@@ -257,6 +259,9 @@ def scan():
     print(f"Number of valid CE/PE rows: {len(df[df['option_type'].isin(['CE', 'PE'])])}")
 
     updated = False
+    # Collect qualifying strikes per side (to group alerts)
+    ce_buildups = []
+    pe_buildups = []
 
     for _, r in df.iterrows():
         strike = int(r.get("strike_price", 0))
@@ -297,20 +302,38 @@ def scan():
                 continue
 
             spot_move = abs(spot - baseline["day_open"]) / baseline["day_open"] * 100
-            trade_strike, trade_opt = select_trade_strike(atm, opt)
 
-            send_telegram(
-                f"🚀 *BANK NIFTY EXECUTION*\n"
-                f"{opt} buildup @ {strike}\n"
-                f"→ Buy {trade_strike} {trade_opt}\n\n"
-                f"OI + {oi_pct:.0f}%   Vol ↑\n"
-                f"Spot Move: {spot_move:.0f}%\n"
-                f"Volume ↑ >30%: {vol_ok}\n"
-                f"Spot: {spot}"
-            )
+            # Collect instead of immediate send
+            if opt == "CE":
+                ce_buildups.append(strike)
+            else:
+                pe_buildups.append(strike)
 
             entry["state"] = "EXECUTED"
             updated = True
+
+    # Grouped alerts after loop (one per side)
+    if ce_buildups:
+        trade_strike, trade_opt = select_trade_strike(ce_buildups[0], "CE")  # use first qualifying strike
+        msg = f"🚀 *EXECUTION SIGNAL - CE BUILDUP*\n" \
+              f"Buy {trade_strike} {trade_opt}\n" \
+              f"Qualifying CE strikes: {', '.join(map(str, ce_buildups))}\n" \
+              f"OI + {oi_pct:.0f}%   Vol ↑\n" \
+              f"Spot Move: {spot_move:.0f}%\n" \
+              f"Volume ↑ >30%: {vol_ok}\n" \
+              f"Spot: {spot}"
+        send_telegram_alert(msg)
+
+    if pe_buildups:
+        trade_strike, trade_opt = select_trade_strike(pe_buildups[0], "PE")
+        msg = f"🚀 *EXECUTION SIGNAL - PE BUILDUP*\n" \
+              f"Buy {trade_strike} {trade_opt}\n" \
+              f"Qualifying PE strikes: {', '.join(map(str, pe_buildups))}\n" \
+              f"OI + {oi_pct:.0f}%   Vol ↑\n" \
+              f"Spot Move: {spot_move:.0f}%\n" \
+              f"Volume ↑ >30%: {vol_ok}\n" \
+              f"Spot: {spot}"
+        send_telegram_alert(msg)
 
     if not baseline["started"]:
         send_telegram(
