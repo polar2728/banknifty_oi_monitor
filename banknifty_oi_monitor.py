@@ -7,13 +7,13 @@ from datetime import datetime, timedelta, timezone
 from fyers_apiv3 import fyersModel
 
 # ================= CONFIG =================
-WATCH_OI_PCT        = 70
-EXEC_OI_PCT         = 140
+WATCH_OI_PCT        = 70      # default early-month
+EXEC_OI_PCT         = 200     # default early-month
 SPOT_MOVE_PCT       = 0.3
 VOL_MULTIPLIER      = 1.5
 MIN_BASE_OI         = 2000
 STRIKE_RANGE        = 200
-CHECK_MARKET_HOURS  = False
+CHECK_MARKET_HOURS  = False   # set to True in production
 BASELINE_FILE       = "bn_baseline_oi.json"
 
 DEBUG_MODE = str(os.environ.get("DEBUG_MODE", "false")).lower() == "true"
@@ -79,12 +79,9 @@ def get_banknifty_spot():
     try:
         v = resp["d"][0].get("v", {})
         lp = v.get("lp") or v.get("ltp") or v.get("prev_close_price")
-
         if lp is None or lp == 0:
             return None
-
         return float(lp)
-
     except Exception:
         if DEBUG_MODE:
             print("❌ Spot parse error:", resp)
@@ -119,9 +116,9 @@ def reset_day(b):
 # ================= EXPIRY =================
 def expiry_to_symbol_format(date_str):
     d = datetime.strptime(date_str, "%d-%m-%Y")
-    year_short = d.strftime("%y")                # "26"
-    month_short = d.strftime("%b").upper()       # "JAN", "FEB", "MAR", ..., "DEC"
-    return year_short + month_short              # "26JAN"
+    year_short = d.strftime("%y")           # "26"
+    month_short = d.strftime("%b").upper()  # "JAN", "FEB", ...
+    return year_short + month_short         # "26JAN"
 
 def get_monthly_expiry(expiry_info):
     today = now_ist().date()
@@ -130,20 +127,24 @@ def get_monthly_expiry(expiry_info):
         try:
             exp = datetime.fromtimestamp(int(e["expiry"])).date()
             days = (exp - today).days
-            if days >= 7:
+            if days >= 7:  # only future expiries with at least 1 week left
                 expiries.append((days, e["date"]))
         except:
             continue
-    return sorted(expiries, key=lambda x: x[0])[0][1] if expiries else None
+    
+    if not expiries:
+        return None
+    
+    # Select the nearest one (smallest days >=7)
+    nearest = min(expiries, key=lambda x: x[0])[1]
+    return nearest
 
 # ================= STRIKE SELECTION =================
-
-def select_trade_strike(strike, buildup_type):
-    # Same-strike contrarian: buy opposite option at the same strike
-    if buildup_type == "CE":   # short buildup on CE → buy PE at same strike
-        return strike, "PE"
-    else:                      # short buildup on PE → buy CE at same strike
-        return strike, "CE"
+def select_trade_strike(atm, buildup_type):
+    if buildup_type == "CE":
+        return atm - 100, "PE"
+    else:
+        return atm + 100, "CE"
 
 # ================= SCAN =================
 def scan():
@@ -153,7 +154,6 @@ def scan():
 
     baseline = reset_day(load_baseline())
 
-    # ---- Spot (SAFE) ----
     spot = get_banknifty_spot()
     if spot is None:
         print("⚠ BANKNIFTY spot unavailable — skipping scan")
@@ -164,36 +164,27 @@ def scan():
 
     atm = int(round(spot / 100) * 100)
 
-    # ---- Option Chain ----
     chain_resp = safe_api_call(fyers.optionchain, {
         "symbol": "NSE:NIFTYBANK-INDEX",
         "strikecount": 40,
         "timestamp": ""
     })
     if not chain_resp:
-        print("Option chain API call returned None — likely network/auth issue")
+        print("Option chain API call returned None")
         return
 
-    print("Optionchain response status:", chain_resp.get("s"))          # Debug: 'ok' or 'error'
-    print("Full chain_resp keys:", list(chain_resp.keys()))            # Debug: see what's actually there
+    print("Optionchain response status:", chain_resp.get("s"))
+    print("Full chain_resp keys:", list(chain_resp.keys()))
 
     if chain_resp.get("s") != "ok":
-        msg = f"Optionchain failed: {chain_resp.get('message', 'Unknown error')} (code: {chain_resp.get('code')})"
-        print(msg)
-        # Optional: send_telegram(msg) if you want alert
+        print(f"Optionchain failed: {chain_resp.get('message', 'Unknown')}")
         return
 
-    # Now safely access
-    data = chain_resp.get("data", {})
-    if not data:
-        print("Response 'ok' but no 'data' key — possibly after-hours empty response")
-        return
-    
     raw = chain_resp["data"]["optionsChain"]
     expiry_info = chain_resp["data"]["expiryData"]
 
     if not raw:
-        print("No optionsChain data returned (empty list) — likely market closed or no contracts loaded")
+        print("No optionsChain data returned")
         return
 
     expiry_date = get_monthly_expiry(expiry_info)
@@ -204,14 +195,12 @@ def scan():
     expiry = expiry_to_symbol_format(expiry_date)
 
     df = pd.DataFrame(raw)
-    # df = df[df["symbol"].str.contains(expiry, regex=False)]
-    
+    df = df[df["symbol"].str.contains(expiry, regex=False)]
     df = df[
         (df["strike_price"].between(atm - STRIKE_RANGE, atm + STRIKE_RANGE)) &
         (df["strike_price"] % 100 == 0)
     ]
 
-    # Debug prints
     print(f"Selected monthly expiry date: {expiry_date}")
     print(f"Expiry filter string: {expiry}")
     print(f"Total raw options: {len(raw)}")
@@ -219,49 +208,25 @@ def scan():
     print(f"After strike range filter: {len(df)}")
     print(f"Number of valid CE/PE rows: {len(df[df['option_type'].isin(['CE', 'PE'])])}")
 
-    # FIXED: Calculate days to expiry correctly
-    expiry_dt = datetime.strptime(expiry_date, "%d-%m-%Y").date()  # ← add .date()
+    # Days to expiry for dynamic thresholds
+    expiry_dt = datetime.strptime(expiry_date, "%d-%m-%Y").date()
     today_dt = now_ist().date()
     days_to_expiry = (expiry_dt - today_dt).days
-    
+
     if days_to_expiry > 14:
         WATCH_OI_PCT = 70
         EXEC_OI_PCT  = 200
-        print(f"Days to expiry: {days_to_expiry} → using low thresholds: {WATCH_OI_PCT}% / {EXEC_OI_PCT}% (early month)")
+        print(f"Days to expiry: {days_to_expiry} → low thresholds: {WATCH_OI_PCT}% / {EXEC_OI_PCT}%")
     elif 8 <= days_to_expiry <= 14:
         WATCH_OI_PCT = 150
         EXEC_OI_PCT  = 300
-        print(f"Days to expiry: {days_to_expiry} → using medium thresholds: {WATCH_OI_PCT}% / {EXEC_OI_PCT}% (mid-cycle)")
-    else:  # <= 7 days
+        print(f"Days to expiry: {days_to_expiry} → medium thresholds: {WATCH_OI_PCT}% / {EXEC_OI_PCT}%")
+    else:
         WATCH_OI_PCT = 300
         EXEC_OI_PCT  = 500
-        print(f"Days to expiry: {days_to_expiry} → using high thresholds: {WATCH_OI_PCT}% / {EXEC_OI_PCT}% (expiry week)")
-    
-
-    expiry = expiry_to_symbol_format(expiry_date)
-
-    df = pd.DataFrame(raw)
-    # First filter: expiry code in symbol
-    df = df[df["symbol"].str.contains(expiry, regex=False)]
-    
-    # Second filter: strike range around ATM + valid strikes
-    df = df[
-        (df["strike_price"].between(atm - STRIKE_RANGE, atm + STRIKE_RANGE)) &
-        (df["strike_price"] % 100 == 0)
-    ]
-
-    # Now safe to print debug info
-    print(f"Selected monthly expiry date: {expiry_date}")
-    print(f"Expiry filter string: {expiry}")
-    print(f"Total raw options: {len(raw)}")
-    print(f"After expiry filter: {len(df[df['symbol'].str.contains(expiry)])}")  # redundant now, but ok
-    print(f"After strike range filter: {len(df)}")
-    print(f"Number of valid CE/PE rows: {len(df[df['option_type'].isin(['CE', 'PE'])])}")
+        print(f"Days to expiry: {days_to_expiry} → high thresholds: {WATCH_OI_PCT}% / {EXEC_OI_PCT}%")
 
     updated = False
-    # Collect qualifying strikes per side (to group alerts)
-    ce_buildups = []
-    pe_buildups = []
 
     for _, r in df.iterrows():
         strike = int(r.get("strike_price", 0))
@@ -285,7 +250,6 @@ def scan():
         oi_pct = ((oi - entry["base_oi"]) / entry["base_oi"]) * 100
         vol_ok = vol > entry["base_vol"] * VOL_MULTIPLIER
 
-        # ---- WATCH ----
         if oi_pct >= WATCH_OI_PCT and entry["state"] == "NONE":
             send_telegram(
                 f"👀 *BN OI WATCH*\n"
@@ -296,64 +260,25 @@ def scan():
             entry["state"] = "WATCH"
             updated = True
 
-        # ---- EXECUTE ----
-        if oi_pct >= EXEC_OI_PCT:
+        if oi_pct >= EXEC_OI_PCT and entry["state"] == "WATCH":
             if not after_1015():
                 continue
 
             spot_move = abs(spot - baseline["day_open"]) / baseline["day_open"] * 100
+            if spot_move < SPOT_MOVE_PCT or not vol_ok:
+                continue
 
-            buildup_info = {
-                "strike": strike,
-                "oi_pct": oi_pct,
-                "vol_ok": vol_ok
-            }
-            # Collect instead of immediate send
-            if opt == "CE":
-                ce_buildups.append(buildup_info)
-            else:
-                pe_buildups.append(buildup_info)
+            trade_strike, trade_opt = select_trade_strike(atm, opt)
 
+            send_telegram(
+                f"🚀 *BANK NIFTY EXECUTION*\n"
+                f"{opt} buildup @ {strike}\n"
+                f"→ Buy {trade_strike} {trade_opt}\n\n"
+                f"OI +{oi_pct:.0f}%   Vol ↑\n"
+                f"Spot Move: {spot_move:.2f}%"
+            )
             entry["state"] = "EXECUTED"
             updated = True
-
-    # Grouped alerts after loop (one per side)
-    if ce_buildups:
-        # Pick first qualifying strike for the trade recommendation
-        first = ce_buildups[0]
-        trade_strike = first["strike"]
-        trade_opt = "PE"  # same-strike contrarian
-
-        details = "\n".join(
-            f"{b['strike']} CE: +{b['oi_pct']:.0f}%"
-            for b in ce_buildups
-        )
-
-        msg = (
-            f"🚀 *EXECUTION SIGNAL - CE BUILDUP*\n"
-            f"Buy {trade_strike} {trade_opt}\n\n"
-            f"Qualifying CE strikes:\n{details}\n\n"
-            f"Spot: {spot}"
-        )
-        send_telegram_alert(msg)
-
-    if pe_buildups:
-        first = pe_buildups[0]
-        trade_strike = first["strike"]
-        trade_opt = "CE"
-
-        details = "\n".join(
-            f"{b['strike']} PE: +{b['oi_pct']:.0f}%"
-            for b in pe_buildups
-        )
-
-        msg = (
-            f"🚀 *EXECUTION SIGNAL - PE BUILDUP*\n"
-            f"Buy {trade_strike} {trade_opt}\n\n"
-            f"Qualifying PE strikes:\n{details}\n\n"
-            f"Spot: {spot}"
-        )
-        send_telegram_alert(msg)
 
     if not baseline["started"]:
         send_telegram(
@@ -364,10 +289,9 @@ def scan():
         baseline["started"] = True
         updated = True
 
-    # NEW: Save if we added any entries (even without alerts)
-    if baseline["data"] or updated:  # or len(baseline["data"]) > 0
+    if updated or baseline["data"]:
         if not baseline["data"]:
-            print("WARNING: Processed rows but no baseline entries added (all OI < MIN_BASE_OI?)")
+            print("WARNING: Processed rows but no baseline entries added (check MIN_BASE_OI or expiry)")
         save_baseline(baseline)
         print("Baseline saved — entries count:", len(baseline["data"]))
     else:
