@@ -116,7 +116,9 @@ def reset_day(b):
 # ================= EXPIRY =================
 def expiry_to_symbol_format(date_str):
     d = datetime.strptime(date_str, "%d-%m-%Y")
-    return d.strftime("%y%m%d")  # "260127" for 27-Jan-2026
+    year_short = d.strftime("%y")           # "26"
+    month_short = d.strftime("%b").upper()  # "JAN", "FEB", ...
+    return year_short + month_short         # "26JAN" - matches Fyers symbol format
 
 def get_monthly_expiry(expiry_info):
     today = now_ist().date()
@@ -129,7 +131,7 @@ def get_monthly_expiry(expiry_info):
             exp = datetime.fromtimestamp(int(e["expiry"])).date()
             days = (exp - today).days
             print(f"Expiry {e['date']}: {exp} → {days} days left")
-            if days >= 0:  # allow current/near expiries
+            if days >= 0:
                 valid_expiries.append((days, e["date"]))
         except Exception as ex:
             print("Expiry parse error:", ex)
@@ -139,10 +141,8 @@ def get_monthly_expiry(expiry_info):
         print("No valid expiry found")
         return None
 
-    # Pick the nearest expiry (smallest non-negative days)
     nearest_days, nearest_date = min(valid_expiries, key=lambda x: x[0])
     print(f"SELECTED EXPIRY: {nearest_date} ({nearest_days} days left)")
-
     return nearest_date
 
 # ================= STRIKE SELECTION =================
