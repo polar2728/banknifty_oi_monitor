@@ -123,21 +123,30 @@ def expiry_to_symbol_format(date_str):
 def get_monthly_expiry(expiry_info):
     today = now_ist().date()
     expiries = []
+    
+    print("DEBUG - All expiry_info from API:", expiry_info)  # raw list from Fyers
+
     for e in expiry_info:
         try:
-            exp = datetime.fromtimestamp(int(e["expiry"])).date()
+            exp_ts = int(e["expiry"])
+            exp = datetime.fromtimestamp(exp_ts).date()
             days = (exp - today).days
-            if days >= 7:  # only future expiries with at least 1 week left
+            print(f"Expiry {e['date']}: {exp} → {days} days left")
+            if days >= 7:  # only expiries with at least 1 week left
                 expiries.append((days, e["date"]))
-        except:
+        except Exception as e:
+            print("Expiry parse error:", e)
             continue
-    
+
     if not expiries:
+        print("No valid monthly expiries found (>=7 days)")
         return None
+
+    # Pick the nearest (smallest days >=7)
+    nearest_days, nearest_date = min(expiries, key=lambda x: x[0])
+    print(f"Selected nearest monthly expiry: {nearest_date} ({nearest_days} days left)")
     
-    # Select the nearest one (smallest days >=7)
-    nearest = min(expiries, key=lambda x: x[0])[1]
-    return nearest
+    return nearest_date
 
 # ================= STRIKE SELECTION =================
 def select_trade_strike(atm, buildup_type):
@@ -195,7 +204,11 @@ def scan():
     expiry = expiry_to_symbol_format(expiry_date)
 
     df = pd.DataFrame(raw)
+    
+    # Apply expiry filter FIRST (critical!)
     df = df[df["symbol"].str.contains(expiry, regex=False)]
+    
+    # Then strike range
     df = df[
         (df["strike_price"].between(atm - STRIKE_RANGE, atm + STRIKE_RANGE)) &
         (df["strike_price"] % 100 == 0)
@@ -250,6 +263,7 @@ def scan():
         oi_pct = ((oi - entry["base_oi"]) / entry["base_oi"]) * 100
         vol_ok = vol > entry["base_vol"] * VOL_MULTIPLIER
 
+        # ---- WATCH ----
         if oi_pct >= WATCH_OI_PCT and entry["state"] == "NONE":
             send_telegram(
                 f"👀 *BN OI WATCH*\n"
@@ -260,6 +274,7 @@ def scan():
             entry["state"] = "WATCH"
             updated = True
 
+        # ---- EXECUTE ----
         if oi_pct >= EXEC_OI_PCT and entry["state"] == "WATCH":
             if not after_1015():
                 continue
@@ -291,7 +306,7 @@ def scan():
 
     if updated or baseline["data"]:
         if not baseline["data"]:
-            print("WARNING: Processed rows but no baseline entries added (check MIN_BASE_OI or expiry)")
+            print("WARNING: Processed rows but no baseline entries added (check MIN_BASE_OI or expiry filter)")
         save_baseline(baseline)
         print("Baseline saved — entries count:", len(baseline["data"]))
     else:
