@@ -116,36 +116,33 @@ def reset_day(b):
 # ================= EXPIRY =================
 def expiry_to_symbol_format(date_str):
     d = datetime.strptime(date_str, "%d-%m-%Y")
-    year_short = d.strftime("%y")           # "26"
-    month_short = d.strftime("%b").upper()  # "JAN", "FEB", ...
-    return year_short + month_short         # "26JAN"
+    return d.strftime("%y%m%d")  # "260127" for 27-Jan-2026
 
 def get_monthly_expiry(expiry_info):
     today = now_ist().date()
-    expiries = []
-    
-    print("DEBUG - All expiry_info from API:", expiry_info)  # raw list from Fyers
+    valid_expiries = []
+
+    print("DEBUG - All expiry_info from API:", expiry_info)
 
     for e in expiry_info:
         try:
-            exp_ts = int(e["expiry"])
-            exp = datetime.fromtimestamp(exp_ts).date()
+            exp = datetime.fromtimestamp(int(e["expiry"])).date()
             days = (exp - today).days
             print(f"Expiry {e['date']}: {exp} → {days} days left")
-            if days >= 7:  # only expiries with at least 1 week left
-                expiries.append((days, e["date"]))
-        except Exception as e:
-            print("Expiry parse error:", e)
+            if days >= 0:  # allow current/near expiries
+                valid_expiries.append((days, e["date"]))
+        except Exception as ex:
+            print("Expiry parse error:", ex)
             continue
 
-    if not expiries:
-        print("No valid monthly expiries found (>=7 days)")
+    if not valid_expiries:
+        print("No valid expiry found")
         return None
 
-    # Pick the nearest (smallest days >=7)
-    nearest_days, nearest_date = min(expiries, key=lambda x: x[0])
-    print(f"Selected nearest monthly expiry: {nearest_date} ({nearest_days} days left)")
-    
+    # Pick the nearest expiry (smallest non-negative days)
+    nearest_days, nearest_date = min(valid_expiries, key=lambda x: x[0])
+    print(f"SELECTED EXPIRY: {nearest_date} ({nearest_days} days left)")
+
     return nearest_date
 
 # ================= STRIKE SELECTION =================
@@ -205,7 +202,7 @@ def scan():
 
     df = pd.DataFrame(raw)
     
-    # Apply expiry filter FIRST (critical!)
+    # Apply expiry filter FIRST
     df = df[df["symbol"].str.contains(expiry, regex=False)]
     
     # Then strike range
@@ -263,7 +260,6 @@ def scan():
         oi_pct = ((oi - entry["base_oi"]) / entry["base_oi"]) * 100
         vol_ok = vol > entry["base_vol"] * VOL_MULTIPLIER
 
-        # ---- WATCH ----
         if oi_pct >= WATCH_OI_PCT and entry["state"] == "NONE":
             send_telegram(
                 f"👀 *BN OI WATCH*\n"
@@ -274,7 +270,6 @@ def scan():
             entry["state"] = "WATCH"
             updated = True
 
-        # ---- EXECUTE ----
         if oi_pct >= EXEC_OI_PCT and entry["state"] == "WATCH":
             if not after_1015():
                 continue
@@ -306,7 +301,7 @@ def scan():
 
     if updated or baseline["data"]:
         if not baseline["data"]:
-            print("WARNING: Processed rows but no baseline entries added (check MIN_BASE_OI or expiry filter)")
+            print("WARNING: Processed rows but no baseline entries added (check MIN_BASE_OI or expiry)")
         save_baseline(baseline)
         print("Baseline saved — entries count:", len(baseline["data"]))
     else:
