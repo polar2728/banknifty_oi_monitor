@@ -289,7 +289,12 @@ def scan():
         if entry["base_oi"] < MIN_BASE_OI:
             continue
 
+        if "base_ltp" not in entry:
+            entry["base_ltp"] = ltp   # use current ltp as fallback for old entries
+            updated = True            # ensure save happens
+
         oi_pct = ((oi - entry["base_oi"]) / entry["base_oi"]) * 100
+        base_ltp = entry.get("base_ltp", ltp)
         ltp_change_pct = ((ltp - entry["base_ltp"]) / entry["base_ltp"] * 100) if entry["base_ltp"] > 0 else 0  # NEW: Compute premium %
         vol_ok = vol > entry["base_vol"] * VOL_MULTIPLIER
 
