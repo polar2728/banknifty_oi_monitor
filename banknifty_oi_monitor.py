@@ -16,6 +16,11 @@ STRIKE_RANGE        = 200
 CHECK_MARKET_HOURS  = False   # set to True in production
 BASELINE_FILE       = "bn_baseline_oi.json"
 
+# ─── New thresholds for video-aligned quality filters ───
+OI_COVERING_THRESHOLD   = -25      # % OI decrease on opposite side (covering)
+OI_BOTH_SIDES_AVOID     = 180      # % if both CE & PE >= this → skip conflicted/range-bound
+PREMIUM_MAX_RISE        = 10       # max allowed premium % rise during buildup (confirms short-ish)
+
 DEBUG_MODE = str(os.environ.get("DEBUG_MODE", "false")).lower() == "true"
 
 # ================= TIMEZONE =================
@@ -128,7 +133,7 @@ def get_monthly_expiry(expiry_info):
 
     for e in expiry_info:
         try:
-            exp = datetime.fromtimestamp(int(e["expiry"])).date()
+            exp = datetime.fromtimestamp(int(e["expiry"]), tz=IST).date()
             days = (exp - today).days
             print(f"Expiry {e['date']}: {exp} → {days} days left")
             if days >= 0:
@@ -225,16 +230,41 @@ def scan():
 
     if days_to_expiry > 14:
         WATCH_OI_PCT = 70
-        EXEC_OI_PCT  = 200
+        EXEC_OI_PCT  = 100
         print(f"Days to expiry: {days_to_expiry} → low thresholds: {WATCH_OI_PCT}% / {EXEC_OI_PCT}%")
     elif 8 <= days_to_expiry <= 14:
-        WATCH_OI_PCT = 150
-        EXEC_OI_PCT  = 300
+        WATCH_OI_PCT = 120
+        EXEC_OI_PCT  = 200
         print(f"Days to expiry: {days_to_expiry} → medium thresholds: {WATCH_OI_PCT}% / {EXEC_OI_PCT}%")
     else:
-        WATCH_OI_PCT = 300
-        EXEC_OI_PCT  = 500
+        WATCH_OI_PCT = 250
+        EXEC_OI_PCT  = 400
         print(f"Days to expiry: {days_to_expiry} → high thresholds: {WATCH_OI_PCT}% / {EXEC_OI_PCT}%")
+
+    OI_BOTH_SIDES_AVOID = max(120, EXEC_OI_PCT * 0.6)   # min floor to avoid being too loose early month
+
+    # === NEW: Pre-compute OI % for opposite-side & conflict checks ===
+    strike_oi_changes = {}   # strike -> {"CE": pct, "PE": pct}
+
+    for _, r in df.iterrows():
+        strike = int(r.get("strike_price", 0))
+        opt    = r.get("option_type", "")
+        oi     = int(r.get("oi", 0))
+
+        if strike == 0 or opt not in ("CE", "PE"):
+            continue
+
+        key = f"{opt}_{strike}"
+        entry = baseline["data"].get(key)
+        if entry is None or entry.get("base_oi", 0) < MIN_BASE_OI:
+            continue
+
+        base_oi = entry["base_oi"]
+        oi_pct  = ((oi - base_oi) / base_oi) * 100 if base_oi > 0 else 0
+
+        if strike not in strike_oi_changes:
+            strike_oi_changes[strike] = {}
+        strike_oi_changes[strike][opt] = oi_pct
 
     updated = False
 
@@ -242,6 +272,7 @@ def scan():
         strike = int(r.get("strike_price", 0))
         opt    = r.get("option_type", "")
         oi     = int(r.get("oi", 0))
+        ltp    = float(r.get("ltp", 0))  # NEW: Capture LTP for premium check
         vol    = int(r.get("volume", 0))
 
         if strike == 0 or opt not in ("CE", "PE"):
@@ -250,6 +281,7 @@ def scan():
         key = f"{opt}_{strike}"
         entry = baseline["data"].setdefault(key, {
             "base_oi": oi,
+            "base_ltp": ltp,  # NEW: Add base_ltp to baseline
             "base_vol": vol,
             "state": "NONE"
         })
@@ -258,8 +290,10 @@ def scan():
             continue
 
         oi_pct = ((oi - entry["base_oi"]) / entry["base_oi"]) * 100
+        ltp_change_pct = ((ltp - entry["base_ltp"]) / entry["base_ltp"] * 100) if entry["base_ltp"] > 0 else 0  # NEW: Compute premium %
         vol_ok = vol > entry["base_vol"] * VOL_MULTIPLIER
 
+        # ================= WATCH (original) =================
         if oi_pct >= WATCH_OI_PCT and entry["state"] == "NONE":
             send_telegram(
                 f"👀 *BN OI WATCH*\n"
@@ -270,7 +304,10 @@ def scan():
             entry["state"] = "WATCH"
             updated = True
 
-        if oi_pct >= EXEC_OI_PCT and entry["state"] == "WATCH":
+        # ================= EXECUTION (enhanced with video filters) =================
+        is_short_buildup = (oi_pct >= EXEC_OI_PCT) and (ltp_change_pct <= PREMIUM_MAX_RISE)
+
+        if oi_pct >= EXEC_OI_PCT and is_short_buildup and entry["state"] == "WATCH":
             if not after_1015():
                 continue
 
@@ -278,17 +315,33 @@ def scan():
             if spot_move < SPOT_MOVE_PCT or not vol_ok:
                 continue
 
-            trade_strike, trade_opt = select_trade_strike(atm, opt)
+            # ─── NEW: Conflict check ───
+            ce_pct_here = strike_oi_changes.get(strike, {}).get("CE", 0)
+            pe_pct_here = strike_oi_changes.get(strike, {}).get("PE", 0)
+            conflicted = (ce_pct_here >= OI_BOTH_SIDES_AVOID and pe_pct_here >= OI_BOTH_SIDES_AVOID)
 
-            send_telegram(
-                f"🚀 *BANK NIFTY EXECUTION*\n"
-                f"{opt} buildup @ {strike}\n"
-                f"→ Buy {trade_strike} {trade_opt}\n\n"
-                f"OI +{oi_pct:.0f}%   Vol ↑\n"
-                f"Spot Move: {spot_move:.2f}%"
-            )
-            entry["state"] = "EXECUTED"
-            updated = True
+            if conflicted:
+                print(f"⛔ Skipping conflicted BN buildup at {strike}: both sides +{ce_pct_here:.0f}% / +{pe_pct_here:.0f}%")
+                continue
+
+            # ─── NEW: Opposite side covering ───
+            opp_opt = "PE" if opt == "CE" else "CE"
+            opp_pct = strike_oi_changes.get(strike, {}).get(opp_opt, 0)
+
+            if opp_pct <= OI_COVERING_THRESHOLD:
+                # Valid signal
+                trade_strike, trade_opt = select_trade_strike(atm, opt)
+
+                send_telegram(
+                    f"🚀 *BANK NIFTY EXECUTION - {opt} BUILDUP*\n"
+                    f"Buy {trade_strike} {trade_opt}\n\n"
+                    f"Qualifying {opt} @ {strike}: +{oi_pct:.0f}% (opp {opp_opt} {opp_pct:+.1f}%)\n"
+                    f"Spot Move: {spot_move:.2f}%   Vol ↑"
+                )
+                entry["state"] = "EXECUTED"
+                updated = True
+            else:
+                print(f"⚠️ BN Near miss at {strike} {opt}: OI +{oi_pct:.0f}%, opposite {opp_pct:+.1f}% (needs <= {OI_COVERING_THRESHOLD}%)")
 
     if not baseline["started"]:
         send_telegram(
