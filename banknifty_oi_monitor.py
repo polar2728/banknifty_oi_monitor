@@ -7,19 +7,19 @@ from datetime import datetime, timedelta, timezone
 from fyers_apiv3 import fyersModel
 
 # ================= CONFIG =================
-WATCH_OI_PCT        = 70      # default early-month
-EXEC_OI_PCT         = 200     # default early-month
-SPOT_MOVE_PCT       = 0.3
-VOL_MULTIPLIER      = 1.5
-MIN_BASE_OI         = 2000
-STRIKE_RANGE        = 200
-CHECK_MARKET_HOURS  = False   # set to True in production
-BASELINE_FILE       = "bn_baseline_oi.json"
+WATCH_OI_PCT = 70 # default early-month
+EXEC_OI_PCT = 200 # default early-month
+SPOT_MOVE_PCT = 0.3
+VOL_MULTIPLIER = 1.5
+MIN_BASE_OI = 2000
+STRIKE_RANGE = 200
+CHECK_MARKET_HOURS = False # set to True in production
+BASELINE_FILE = "bn_baseline_oi.json"
 
 # ─── New thresholds for video-aligned quality filters ───
-OI_COVERING_THRESHOLD   = -25      # % OI decrease on opposite side (covering)
-OI_BOTH_SIDES_AVOID     = 180      # % if both CE & PE >= this → skip conflicted/range-bound
-PREMIUM_MAX_RISE        = 10       # max allowed premium % rise during buildup (confirms short-ish)
+OI_BOTH_SIDES_AVOID = 180 # % if both CE & PE >= this → skip conflicted/range-bound
+PREMIUM_MAX_RISE = 2 # max allowed premium % rise during buildup (confirms short)
+MIN_DECLINE_PCT = -1.5 # minimum decline % for opposite side (noise filter)
 
 DEBUG_MODE = str(os.environ.get("DEBUG_MODE", "false")).lower() == "true"
 
@@ -27,9 +27,9 @@ DEBUG_MODE = str(os.environ.get("DEBUG_MODE", "false")).lower() == "true"
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # ================= SECRETS =================
-CLIENT_ID        = os.environ.get("CLIENT_ID")
-ACCESS_TOKEN     = os.environ.get("ACCESS_TOKEN")
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
+CLIENT_ID = os.environ.get("CLIENT_ID")
+ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 if not CLIENT_ID or not ACCESS_TOKEN:
@@ -121,9 +121,9 @@ def reset_day(b):
 # ================= EXPIRY =================
 def expiry_to_symbol_format(date_str):
     d = datetime.strptime(date_str, "%d-%m-%Y")
-    year_short = d.strftime("%y")           # "26"
-    month_short = d.strftime("%b").upper()  # "JAN", "FEB", ...
-    return year_short + month_short         # "26JAN" - matches Fyers symbol format
+    year_short = d.strftime("%y")
+    month_short = d.strftime("%b").upper()
+    return year_short + month_short
 
 def get_monthly_expiry(expiry_info):
     today = now_ist().date()
@@ -159,9 +159,9 @@ def select_trade_strike(atm, buildup_type):
 
 # ================= SCAN =================
 def scan():
-    if CHECK_MARKET_HOURS and not is_market_open():
-        print("⏱ Market closed")
-        return
+    # if CHECK_MARKET_HOURS and not is_market_open():
+    #     print("⏱ Market closed")
+    #     return
 
     baseline = reset_day(load_baseline())
 
@@ -231,20 +231,24 @@ def scan():
     if days_to_expiry > 14:
         WATCH_OI_PCT = 70
         EXEC_OI_PCT  = 100
+        MIN_DECLINE_PCT = -1.5
         print(f"Days to expiry: {days_to_expiry} → low thresholds: {WATCH_OI_PCT}% / {EXEC_OI_PCT}%")
     elif 8 <= days_to_expiry <= 14:
         WATCH_OI_PCT = 120
         EXEC_OI_PCT  = 200
+        MIN_DECLINE_PCT = -1.2
         print(f"Days to expiry: {days_to_expiry} → medium thresholds: {WATCH_OI_PCT}% / {EXEC_OI_PCT}%")
     else:
         WATCH_OI_PCT = 250
         EXEC_OI_PCT  = 400
+        MIN_DECLINE_PCT = -0.8  # less strict near expiry
         print(f"Days to expiry: {days_to_expiry} → high thresholds: {WATCH_OI_PCT}% / {EXEC_OI_PCT}%")
 
-    OI_BOTH_SIDES_AVOID = max(120, EXEC_OI_PCT * 0.6)   # min floor to avoid being too loose early month
+    OI_BOTH_SIDES_AVOID = max(120, EXEC_OI_PCT * 0.6)
 
-    # === NEW: Pre-compute OI % for opposite-side & conflict checks ===
+    # === Pre-compute OI % for opposite-side & conflict checks ===
     strike_oi_changes = {}   # strike -> {"CE": pct, "PE": pct}
+    current_oi_map = {}      # (strike, opt) -> current_oi
 
     for _, r in df.iterrows():
         strike = int(r.get("strike_price", 0))
@@ -253,6 +257,9 @@ def scan():
 
         if strike == 0 or opt not in ("CE", "PE"):
             continue
+
+        # Store current OI for later lookup
+        current_oi_map[(strike, opt)] = oi
 
         key = f"{opt}_{strike}"
         entry = baseline["data"].get(key)
@@ -283,18 +290,14 @@ def scan():
             "base_oi": oi,
             "base_ltp": ltp,  # NEW: Add base_ltp to baseline
             "base_vol": vol,
+            "prev_oi": oi,    # Initialize prev_oi
             "state": "NONE"
         })
 
         if entry["base_oi"] < MIN_BASE_OI:
             continue
 
-        if "base_ltp" not in entry:
-            entry["base_ltp"] = ltp   # use current ltp as fallback for old entries
-            updated = True            # ensure save happens
-
         oi_pct = ((oi - entry["base_oi"]) / entry["base_oi"]) * 100
-        base_ltp = entry.get("base_ltp", ltp)
         ltp_change_pct = ((ltp - entry["base_ltp"]) / entry["base_ltp"] * 100) if entry["base_ltp"] > 0 else 0  # NEW: Compute premium %
         vol_ok = vol > entry["base_vol"] * VOL_MULTIPLIER
 
@@ -312,7 +315,7 @@ def scan():
         # ================= EXECUTION (enhanced with video filters) =================
         is_short_buildup = (oi_pct >= EXEC_OI_PCT) and (ltp_change_pct <= PREMIUM_MAX_RISE)
 
-        if oi_pct >= EXEC_OI_PCT and is_short_buildup and entry["state"] == "WATCH":
+        if is_short_buildup and entry["state"] == "WATCH":
             if not after_1015():
                 continue
 
@@ -331,31 +334,43 @@ def scan():
 
             # ─── NEW: Opposite side covering ───
             opp_opt = "PE" if opt == "CE" else "CE"
-            opp_pct = strike_oi_changes.get(strike, {}).get(opp_opt, 0)
+            opp_key = f"{opp_opt}_{strike}"
+            opp_entry = baseline["data"].get(opp_key)
 
-            if opp_pct <= OI_COVERING_THRESHOLD:
+            if opp_entry:
+                opp_current_oi = current_oi_map.get((strike, opp_opt), 0)
+                
+                if opp_current_oi == 0:
+                    print(f"⚠️ No current data for opposite {opp_opt} at {strike}")
+                    continue
+                
+                opp_prev_oi = opp_entry.get("prev_oi", opp_entry.get("base_oi", 0))
+                
+                opp_decline_pct = ((opp_current_oi - opp_prev_oi) / opp_prev_oi * 100) if opp_prev_oi > 0 else 0
+                
+                is_covering = (opp_current_oi < opp_prev_oi) and (opp_decline_pct <= MIN_DECLINE_PCT)
+                
+                if not is_covering:
+                    opp_pct = strike_oi_changes.get(strike, {}).get(opp_opt, 0)
+                    print(f"⚠️ BN Near miss at {strike} {opt}: OI +{oi_pct:.0f}%, opposite {opp_pct:+.1f}% (decline {opp_decline_pct:+.1f}%, needs <= {MIN_DECLINE_PCT}%)")
+                    continue
+                
+                # NEW: Debug print when covering detected
+                print(f"✓ BN Covering detected at {strike} {opt}: {opp_opt} {opp_decline_pct:.1f}% ({opp_prev_oi} → {opp_current_oi})")
+                
                 # Valid signal
                 trade_strike, trade_opt = select_trade_strike(atm, opt)
 
                 send_telegram(
                     f"🚀 *BANK NIFTY EXECUTION - {opt} BUILDUP*\n"
                     f"Buy {trade_strike} {trade_opt}\n\n"
-                    f"Qualifying {opt} @ {strike}: +{oi_pct:.0f}% (opp {opp_opt} {opp_pct:+.1f}%)\n"
+                    f"Qualifying {opt} @ {strike}: +{oi_pct:.0f}% (opp {opp_opt} {opp_decline_pct:+.1f}%)\n"
                     f"Spot Move: {spot_move:.2f}%   Vol ↑"
                 )
                 entry["state"] = "EXECUTED"
                 updated = True
             else:
-                print(f"⚠️ BN Near miss at {strike} {opt}: OI +{oi_pct:.0f}%, opposite {opp_pct:+.1f}% (needs <= {OI_COVERING_THRESHOLD}%)")
-
-    if not baseline["started"]:
-        send_telegram(
-            f"*BANK NIFTY OI MONITOR STARTED*\n"
-            f"Spot: {spot:.0f}   ATM: {atm}\n"
-            f"Monthly expiry: {expiry_date}"
-        )
-        baseline["started"] = True
-        updated = True
+                print(f"⚠️ BN No opposite side entry for {strike} {opt}")
 
     if updated or baseline["data"]:
         if not baseline["data"]:
