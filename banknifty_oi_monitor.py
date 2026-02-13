@@ -165,24 +165,6 @@ def scan():
 
     baseline = reset_day(load_baseline())
 
-    if not baseline["started"]:
-        spot_temp = get_banknifty_spot()  # temporary fetch just for alert
-        if spot_temp is not None:
-            atm_temp = int(round(spot_temp / 100) * 100)
-            send_telegram(
-                f"✅ *BANK NIFTY OI MONITOR STARTED*\n"
-                f"Spot: {spot_temp:.0f}   ATM: {atm_temp}\n"
-                f"Monthly expiry: {expiry_date if 'expiry_date' in locals() else 'N/A'}"
-            )
-        else:
-            send_telegram(
-                f"✅ *BANK NIFTY OI MONITOR STARTED*\n"
-                f"(Spot fetch failed for alert)\n"
-                f"Monthly expiry: {expiry_date if 'expiry_date' in locals() else 'N/A'}"
-            )
-        baseline["started"] = True
-        updated = True   # ensure save happens
-
     spot = get_banknifty_spot()
     if spot is None:
         print("⚠ BANKNIFTY spot unavailable — skipping scan")
@@ -390,7 +372,15 @@ def scan():
             else:
                 print(f"⚠️ BN No opposite side entry for {strike} {opt}")
 
-
+    if not baseline["started"]:
+        send_telegram(
+            f"*BANK NIFTY OI MONITOR STARTED*\n"
+            f"Spot: {spot:.0f}   ATM: {atm}\n"
+            f"Monthly expiry: {expiry_date}"
+        )
+        baseline["started"] = True
+        updated = True
+        
     if updated or baseline["data"]:
         if not baseline["data"]:
             print("WARNING: Processed rows but no baseline entries added (check MIN_BASE_OI or expiry)")
