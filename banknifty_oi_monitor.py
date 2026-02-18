@@ -538,9 +538,9 @@ def record_signal(baseline, signal_data):
 
 # ================= MAIN SCAN =================
 def scan():
-    # if CHECK_MARKET_HOURS and not is_market_open():
-    #     print("⏱ Market closed")
-    #     return
+    if CHECK_MARKET_HOURS and not is_market_open():
+        print("⏱ Market closed")
+        return
 
     baseline = reset_day(load_baseline())
     baseline = migrate_baseline_if_needed(baseline)
