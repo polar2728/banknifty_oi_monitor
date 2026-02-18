@@ -20,7 +20,7 @@ VOL_MULTIPLIER = 1.5
 
 # ─── Quality filters ───
 OI_BOTH_SIDES_AVOID = 180
-PREMIUM_MAX_RISE = 2
+PREMIUM_MAX_RISE = 8
 MIN_DECLINE_PCT = -1.5
 
 # ─── Conviction scoring ───
@@ -127,7 +127,8 @@ def log_conviction_score(signal_data):
                     "decline_streak": signal_data.get("decline_streak_pts", 0),
                     "spot_alignment": signal_data.get("spot_pts", 0),
                     "sustainability": signal_data.get("sustainability_pts", 0),
-                    "cluster": signal_data.get("cluster_pts", 0)
+                    "cluster": signal_data.get("cluster_pts", 0),
+                    "iv": signal_data.get("iv_pts", 0)  # NEW: Add IV component to log
                 }
             }
             f.write(json.dumps(log_entry) + "\n")
@@ -213,6 +214,9 @@ def migrate_baseline_if_needed(baseline):
             migrated = True
         if "decline_streak" not in entry:
             entry["decline_streak"] = 0
+            migrated = True
+        if "base_iv" not in entry:  # NEW: Migrate for IV
+            entry["base_iv"] = 0
             migrated = True
     
     if migrated:
@@ -311,7 +315,7 @@ def check_adjacent_cluster(strike, opt, strike_oi_changes, exec_threshold):
 def calculate_conviction_score(buildup_data, atm, day_open, spot, strike_oi_changes):
     """
     Calculate conviction score for Bank Nifty signals.
-    Max: 175 points (with decline_streak bonus)
+    Max: 195 points (with decline_streak bonus + new IV component)
     """
     score = 0
     details = []
@@ -327,6 +331,7 @@ def calculate_conviction_score(buildup_data, atm, day_open, spot, strike_oi_chan
     decline_streak = buildup_data.get('decline_streak', 0)
     spot_move_pct = buildup_data.get('spot_move_pct', 0)
     exec_threshold = buildup_data.get('exec_threshold', 200)
+    iv_change_pct = buildup_data.get('iv_change_pct', 0)  # NEW: IV change
     
     # A. Strike Quality (0-30 points) - Bank Nifty 100-point strikes
     strike_distance = abs(strike - atm)
@@ -462,6 +467,22 @@ def calculate_conviction_score(buildup_data, atm, day_open, spot, strike_oi_chan
         details.append("○ Isolated strike (+0)")
     score += pts
     components['cluster_pts'] = pts
+
+    # H. IV Confirmation (NEW: 0-20 points, favoring elevated but not crushing IV)
+    if iv_change_pct >= 15:
+        pts = 20
+        details.append(f"✓ High IV expansion +{iv_change_pct:.1f}% (+20)")
+    elif iv_change_pct >= 5:
+        pts = 10
+        details.append(f"✓ Moderate IV rise +{iv_change_pct:.1f}% (+10)")
+    elif iv_change_pct > -5:
+        pts = 5
+        details.append(f"○ Stable IV {iv_change_pct:.1f}% (+5)")
+    else:
+        pts = -10
+        details.append(f"✗ IV crush {iv_change_pct:.1f}% (-10)")
+    score += pts
+    components['iv_pts'] = pts
     
     # Determine tier
     if score >= 120:
@@ -517,9 +538,9 @@ def record_signal(baseline, signal_data):
 
 # ================= MAIN SCAN =================
 def scan():
-    if CHECK_MARKET_HOURS and not is_market_open():
-        print("⏱ Market closed")
-        return
+    # if CHECK_MARKET_HOURS and not is_market_open():
+    #     print("⏱ Market closed")
+    #     return
 
     baseline = reset_day(load_baseline())
     baseline = migrate_baseline_if_needed(baseline)
@@ -651,6 +672,7 @@ def scan():
         oi = int(r.get("oi", 0))
         ltp = float(r.get("ltp", 0))
         vol = int(r.get("volume", 0))
+        iv = float(r.get("iv", 0))  # NEW: Fetch IV from Fyers data
 
         if strike == 0 or opt not in ("CE", "PE"):
             continue
@@ -661,6 +683,7 @@ def scan():
             "base_ltp": ltp,
             "base_vol": vol,
             "prev_oi": oi,
+            "base_iv": iv,  # NEW: Store base IV
             "state": "NONE",
             "first_exec_time": None,
             "scan_count": 0,
@@ -673,6 +696,7 @@ def scan():
         oi_pct = ((oi - entry["base_oi"]) / entry["base_oi"]) * 100
         ltp_change_pct = ((ltp - entry["base_ltp"]) / entry["base_ltp"] * 100) if entry["base_ltp"] > 0 else 0
         vol_multiplier = vol / entry["base_vol"] if entry["base_vol"] > 0 else 1
+        iv_change_pct = ((iv - entry["base_iv"]) / entry["base_iv"] * 100) if entry["base_iv"] > 0 else 0  # NEW: Compute IV change
 
         # ================= WATCH (TWO-TIER WITH FILTERS) =================
         if oi_pct >= WATCH_OI_PCT and entry["state"] == "NONE":
@@ -787,7 +811,8 @@ def scan():
                 "scan_count": entry.get("scan_count", 1),
                 "spot_move_pct": spot_move_pct,
                 "exec_threshold": EXEC_OI_PCT,
-                "days_to_expiry": days_to_expiry
+                "days_to_expiry": days_to_expiry,
+                "iv_change_pct": iv_change_pct  # NEW: Pass IV change to scorer
             }
 
             # Calculate conviction score
@@ -864,7 +889,7 @@ def scan():
 
             msg = (
                 f"{buildup['emoji']} *BN EXECUTION - {buildup['opt_type']} BUILDUP*\n"
-                f"*Tier: {buildup['tier']} | Score: {buildup['conviction_score']}/175*\n"
+                f"*Tier: {buildup['tier']} | Score: {buildup['conviction_score']}/195*\n"  # NEW: Updated max score
             )
             
             if is_replacement:
