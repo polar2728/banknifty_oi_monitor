@@ -20,7 +20,7 @@ VOL_MULTIPLIER = 1.5
 
 # ─── Quality filters ───
 OI_BOTH_SIDES_AVOID = 180
-PREMIUM_MAX_RISE = 8
+PREMIUM_MAX_RISE = 8    # Dynamic tolerance for premium movement
 MIN_DECLINE_PCT = -1.5
 
 # ─── Conviction scoring ───
@@ -128,7 +128,7 @@ def log_conviction_score(signal_data):
                     "spot_alignment": signal_data.get("spot_pts", 0),
                     "sustainability": signal_data.get("sustainability_pts", 0),
                     "cluster": signal_data.get("cluster_pts", 0),
-                    "iv": signal_data.get("iv_pts", 0)  # NEW: Add IV component to log
+                    "premium_behavior": signal_data.get("premium_behavior_pts", 0)
                 }
             }
             f.write(json.dumps(log_entry) + "\n")
@@ -214,9 +214,6 @@ def migrate_baseline_if_needed(baseline):
             migrated = True
         if "decline_streak" not in entry:
             entry["decline_streak"] = 0
-            migrated = True
-        if "base_iv" not in entry:  # NEW: Migrate for IV
-            entry["base_iv"] = 0
             migrated = True
     
     if migrated:
@@ -315,7 +312,7 @@ def check_adjacent_cluster(strike, opt, strike_oi_changes, exec_threshold):
 def calculate_conviction_score(buildup_data, atm, day_open, spot, strike_oi_changes):
     """
     Calculate conviction score for Bank Nifty signals.
-    Max: 195 points (with decline_streak bonus + new IV component)
+    Max: 190 points (with premium behavior component)
     """
     score = 0
     details = []
@@ -331,7 +328,7 @@ def calculate_conviction_score(buildup_data, atm, day_open, spot, strike_oi_chan
     decline_streak = buildup_data.get('decline_streak', 0)
     spot_move_pct = buildup_data.get('spot_move_pct', 0)
     exec_threshold = buildup_data.get('exec_threshold', 200)
-    iv_change_pct = buildup_data.get('iv_change_pct', 0)  # NEW: IV change
+    ltp_change_pct = buildup_data.get('ltp_change_pct', 0)
     
     # A. Strike Quality (0-30 points) - Bank Nifty 100-point strikes
     strike_distance = abs(strike - atm)
@@ -468,21 +465,26 @@ def calculate_conviction_score(buildup_data, atm, day_open, spot, strike_oi_chan
     score += pts
     components['cluster_pts'] = pts
 
-    # H. IV Confirmation (NEW: 0-20 points, favoring elevated but not crushing IV)
-    if iv_change_pct >= 15:
-        pts = 20
-        details.append(f"✓ High IV expansion +{iv_change_pct:.1f}% (+20)")
-    elif iv_change_pct >= 5:
+    # H. Premium Behavior (0-15 points)
+    # Validates true short buildup vs delta/gamma effects
+    # Short buildup = premium should be flat or falling despite OI spike
+    if ltp_change_pct <= -5:
+        pts = 15
+        details.append(f"✓ Premium falling {ltp_change_pct:.1f}% (+15)")
+    elif ltp_change_pct <= 0:
         pts = 10
-        details.append(f"✓ Moderate IV rise +{iv_change_pct:.1f}% (+10)")
-    elif iv_change_pct > -5:
+        details.append(f"✓ Premium flat {ltp_change_pct:.1f}% (+10)")
+    elif ltp_change_pct <= 5:
         pts = 5
-        details.append(f"○ Stable IV {iv_change_pct:.1f}% (+5)")
+        details.append(f"○ Slight rise {ltp_change_pct:.1f}% (+5)")
+    elif ltp_change_pct <= PREMIUM_MAX_RISE:
+        pts = 0
+        details.append(f"○ Rising {ltp_change_pct:.1f}% (+0)")
     else:
         pts = -10
-        details.append(f"✗ IV crush {iv_change_pct:.1f}% (-10)")
+        details.append(f"✗ High rise {ltp_change_pct:.1f}% (-10)")
     score += pts
-    components['iv_pts'] = pts
+    components['premium_behavior_pts'] = pts
     
     # Determine tier
     if score >= 120:
@@ -623,6 +625,22 @@ def scan():
         MIN_CONVICTION_SCORE = 120
         print(f"Days to expiry: {days_to_expiry} → Expiry week (require 120+ PREMIUM only)")
 
+    # Calculate dynamic premium tolerance based on spot move
+    spot_move_pct = 0
+    if baseline.get("day_open"):
+        spot_move_pct = ((spot - baseline["day_open"]) / baseline["day_open"]) * 100
+    
+    abs_spot_move = abs(spot_move_pct)
+    if abs_spot_move >= 0.5:
+        PREMIUM_TOLERANCE = 15
+        print(f"Spot move {abs_spot_move:.2f}% → Premium tolerance: 15%")
+    elif abs_spot_move >= 0.3:
+        PREMIUM_TOLERANCE = 10
+        print(f"Spot move {abs_spot_move:.2f}% → Premium tolerance: 10%")
+    else:
+        PREMIUM_TOLERANCE = PREMIUM_MAX_RISE
+        print(f"Spot move {abs_spot_move:.2f}% → Premium tolerance: {PREMIUM_MAX_RISE}%")
+
     expiry = expiry_to_symbol_format(expiry_date)
     df = pd.DataFrame(raw)
     df = df[df["symbol"].str.contains(expiry, regex=False)]
@@ -672,7 +690,6 @@ def scan():
         oi = int(r.get("oi", 0))
         ltp = float(r.get("ltp", 0))
         vol = int(r.get("volume", 0))
-        iv = float(r.get("iv", 0))  # NEW: Fetch IV from Fyers data
 
         if strike == 0 or opt not in ("CE", "PE"):
             continue
@@ -683,7 +700,6 @@ def scan():
             "base_ltp": ltp,
             "base_vol": vol,
             "prev_oi": oi,
-            "base_iv": iv,  # NEW: Store base IV
             "state": "NONE",
             "first_exec_time": None,
             "scan_count": 0,
@@ -696,7 +712,6 @@ def scan():
         oi_pct = ((oi - entry["base_oi"]) / entry["base_oi"]) * 100
         ltp_change_pct = ((ltp - entry["base_ltp"]) / entry["base_ltp"] * 100) if entry["base_ltp"] > 0 else 0
         vol_multiplier = vol / entry["base_vol"] if entry["base_vol"] > 0 else 1
-        iv_change_pct = ((iv - entry["base_iv"]) / entry["base_iv"] * 100) if entry["base_iv"] > 0 else 0  # NEW: Compute IV change
 
         # ================= WATCH (TWO-TIER WITH FILTERS) =================
         if oi_pct >= WATCH_OI_PCT and entry["state"] == "NONE":
@@ -748,7 +763,8 @@ def scan():
         if entry["state"] == "EXECUTED":
             continue
 
-        is_aggressive_writing = (oi_pct >= EXEC_OI_PCT) and (ltp_change_pct <= PREMIUM_MAX_RISE)
+        # Use dynamic premium tolerance
+        is_aggressive_writing = (oi_pct >= EXEC_OI_PCT) and (ltp_change_pct <= PREMIUM_TOLERANCE)
 
         if is_aggressive_writing and entry["state"] == "WATCH":
             # Bank Nifty specific: wait until 10:15 AM
@@ -756,7 +772,6 @@ def scan():
                 continue
 
             # Bank Nifty specific: spot move requirement
-            spot_move_pct = ((spot - baseline["day_open"]) / baseline["day_open"]) * 100
             if abs(spot_move_pct) < SPOT_MOVE_PCT or vol_multiplier < VOL_MULTIPLIER:
                 continue
 
@@ -811,8 +826,7 @@ def scan():
                 "scan_count": entry.get("scan_count", 1),
                 "spot_move_pct": spot_move_pct,
                 "exec_threshold": EXEC_OI_PCT,
-                "days_to_expiry": days_to_expiry,
-                "iv_change_pct": iv_change_pct  # NEW: Pass IV change to scorer
+                "days_to_expiry": days_to_expiry
             }
 
             # Calculate conviction score
@@ -889,7 +903,7 @@ def scan():
 
             msg = (
                 f"{buildup['emoji']} *BN EXECUTION - {buildup['opt_type']} BUILDUP*\n"
-                f"*Tier: {buildup['tier']} | Score: {buildup['conviction_score']}/195*\n"  # NEW: Updated max score
+                f"*Tier: {buildup['tier']} | Score: {buildup['conviction_score']}/190*\n"
             )
             
             if is_replacement:
@@ -899,6 +913,7 @@ def scan():
                 f"\n*Action: Buy {buildup['trade_strike']} {buildup['trade_opt']}*\n\n"
                 f"📊 *Score Breakdown:*\n{score_breakdown}\n\n"
                 f"OI: +{buildup['oi_pct']:.0f}% | Opp: {buildup['opp_decline_pct']:.1f}%\n"
+                f"Premium: {buildup['ltp_change_pct']:+.1f}%\n"
                 f"Spot: {spot:.0f} | Move: {buildup['spot_move_pct']:.2f}%\n"
                 f"Signals today: {baseline.get('signals_today', 0) + 1}/{MAX_SIGNALS_PER_DAY}"
             )
